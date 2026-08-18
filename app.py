@@ -10,8 +10,11 @@ from pydantic import BaseModel
 
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableLambda
+
 from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langserve import add_routes
 
 
 # ============================================================
@@ -21,7 +24,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 api_key = os.environ.get("GEMINI_API_KEY")
 
 if not api_key:
-    raise ValueError("GEMINI_API_KEY environment variable is not set.")
+    raise ValueError(
+        "GEMINI_API_KEY environment variable is not set."
+    )
 
 
 llm_flash = ChatGoogleGenerativeAI(
@@ -114,8 +119,8 @@ def generate_test_cases(task_description: str) -> str:
 
 def task_input_node(state: CrewState):
 
-    # For web deployment, the task is already supplied
-    # through the API request.
+    # In the web version, the task is already supplied
+    # through the LangServe Playground.
 
     return {
         "next_step": "developer"
@@ -167,7 +172,10 @@ def real_time_tester(state: CrewState):
 
     task = state["messages"][-1].content
 
+    # --------------------------------------------------------
     # Generate test cases
+    # --------------------------------------------------------
+
     test_cases = generate_test_cases.invoke(task)
 
     content = test_cases
@@ -188,14 +196,20 @@ def real_time_tester(state: CrewState):
     else:
         cases_str = str(content)
 
+    # --------------------------------------------------------
     # Execute generated code
+    # --------------------------------------------------------
+
     execution_result = run_python_code.invoke(
         {
             "code": state["code"]
         }
     )
 
+    # --------------------------------------------------------
     # Create report
+    # --------------------------------------------------------
+
     report = (
         f"### EXECUTION OUTPUT:\n"
         f"{execution_result}\n\n"
@@ -213,7 +227,7 @@ def manager_decision_node(state: CrewState):
     print("[Manager] Reviewing test report...")
 
     # In the web version we don't use input().
-    # The manager simply completes the current workflow.
+    # The manager automatically completes the workflow.
 
     return {
         "next_step": "archiver"
@@ -234,6 +248,11 @@ def archiver_node(state: CrewState):
 # ============================================================
 
 rt_workflow = StateGraph(CrewState)
+
+
+# ------------------------------------------------------------
+# Add nodes
+# ------------------------------------------------------------
 
 rt_workflow.add_node(
     "task_input",
@@ -261,7 +280,9 @@ rt_workflow.add_node(
 )
 
 
+# ------------------------------------------------------------
 # START → task_input
+# ------------------------------------------------------------
 
 rt_workflow.add_edge(
     START,
@@ -269,7 +290,9 @@ rt_workflow.add_edge(
 )
 
 
+# ------------------------------------------------------------
 # task_input → developer
+# ------------------------------------------------------------
 
 def route_from_input(state):
 
@@ -285,7 +308,9 @@ rt_workflow.add_conditional_edges(
 )
 
 
+# ------------------------------------------------------------
 # developer → tester
+# ------------------------------------------------------------
 
 rt_workflow.add_edge(
     "developer",
@@ -293,7 +318,9 @@ rt_workflow.add_edge(
 )
 
 
+# ------------------------------------------------------------
 # tester → manager
+# ------------------------------------------------------------
 
 rt_workflow.add_edge(
     "tester",
@@ -301,7 +328,9 @@ rt_workflow.add_edge(
 )
 
 
+# ------------------------------------------------------------
 # manager → archiver
+# ------------------------------------------------------------
 
 def route_from_decision(state):
 
@@ -317,7 +346,9 @@ rt_workflow.add_conditional_edges(
 )
 
 
+# ------------------------------------------------------------
 # archiver → END
+# ------------------------------------------------------------
 
 rt_workflow.add_edge(
     "archiver",
@@ -325,7 +356,9 @@ rt_workflow.add_edge(
 )
 
 
+# ------------------------------------------------------------
 # Compile graph
+# ------------------------------------------------------------
 
 rt_app = rt_workflow.compile()
 
@@ -336,22 +369,89 @@ rt_app = rt_workflow.compile()
 
 app = FastAPI(
     title="Agentic AI LangGraph System",
-    description="Developer → Tester → Manager → Archiver Agentic AI pipeline",
+    description=(
+        "Developer → Tester → Manager → Archiver "
+        "Agentic AI pipeline"
+    ),
     version="1.0.0"
 )
 
 
 # ============================================================
-# 7. REQUEST MODEL
+# 7. LANGSERVE INPUT MODEL
 # ============================================================
 
-class TaskRequest(BaseModel):
-
-    task: str
+class AgentInput(BaseModel):
+    input: str
 
 
 # ============================================================
-# 8. ROOT / HEALTH ENDPOINT
+# 8. LANGSERVE WRAPPER
+# ============================================================
+
+def run_langgraph(data):
+    """
+    Convert Playground input into CrewState,
+    execute the LangGraph,
+    and return a clean response.
+    """
+
+    # --------------------------------------------------------
+    # Get user's task
+    # --------------------------------------------------------
+
+    if isinstance(data, dict):
+        task = data.get("input", "")
+    else:
+        task = str(data)
+
+    # --------------------------------------------------------
+    # Create initial LangGraph state
+    # --------------------------------------------------------
+
+    initial_state: CrewState = {
+        "messages": [
+            HumanMessage(
+                content=task
+            )
+        ],
+        "next_step": "developer",
+        "code": None,
+        "report": None
+    }
+
+    # --------------------------------------------------------
+    # Run LangGraph
+    # --------------------------------------------------------
+
+    final_state = rt_app.invoke(
+        initial_state,
+        config={
+            "recursion_limit": 50
+        }
+    )
+
+    # --------------------------------------------------------
+    # Return final result
+    # --------------------------------------------------------
+
+    return {
+        "task": task,
+        "generated_code": final_state.get("code"),
+        "report": final_state.get("report"),
+        "status": "completed"
+    }
+
+
+agent_chain = (
+    RunnableLambda(run_langgraph)
+).with_types(
+    input_type=AgentInput
+)
+
+
+# ============================================================
+# 9. ROOT / HEALTH ENDPOINT
 # ============================================================
 
 @app.get("/")
@@ -359,54 +459,25 @@ def root():
 
     return {
         "message": "Agentic AI LangGraph API is running!",
-        "status": "healthy"
+        "status": "healthy",
+        "playground": "/agent/playground/"
     }
 
 
 # ============================================================
-# 9. RUN AGENT ENDPOINT
+# 10. LANGSERVE PLAYGROUND
 # ============================================================
 
-@app.post("/run")
-def run_agent(request: TaskRequest):
-
-    try:
-
-        initial_state: CrewState = {
-            "messages": [
-                HumanMessage(
-                    content=request.task
-                )
-            ],
-            "next_step": "developer",
-            "code": None,
-            "report": None
-        }
-
-        final_state = rt_app.invoke(
-            initial_state,
-            config={
-                "recursion_limit": 50
-            }
-        )
-
-        return {
-            "task": request.task,
-            "generated_code": final_state.get("code"),
-            "report": final_state.get("report"),
-            "status": "completed"
-        }
-
-    except Exception as e:
-
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+add_routes(
+    app,
+    agent_chain,
+    path="/agent",
+    playground_type="default"
+)
 
 
 # ============================================================
-# 10. RUN LOCALLY
+# 11. RUN LOCALLY
 # ============================================================
 
 if __name__ == "__main__":
